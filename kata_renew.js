@@ -10,6 +10,15 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const TG_THREAD_ID = process.env.TG_THREAD_ID;
 
+// 调试截图推送开关 (支持环境变量 DEBUG 或 DEBUG_SCREENSHOT: true / 1 / yes / on)
+const IS_DEBUG_MODE = ['true', '1', 'yes', 'on'].includes(
+    (process.env.DEBUG_SCREENSHOT || process.env.DEBUG || '').trim().toLowerCase()
+);
+if (IS_DEBUG_MODE) {
+    console.log('🔍 [调试模式] 已开启 DEBUG 截图实时 Telegram 推送！');
+}
+
+
 let stats = {
     total: 0,
     success: 0,
@@ -116,7 +125,7 @@ function parseUsersString(raw) {
     for (let line of lines) {
         line = line.trim();
         if (!line || line.startsWith('#') || line.startsWith('//')) continue;
-        
+
         let parts = [];
         if (line.includes('----')) {
             parts = line.split('----');
@@ -156,7 +165,7 @@ function parseExpiryDate(dateStr) {
             }
         }
     }
-    
+
     if (nextD && !isNaN(nextD.getTime())) {
         return Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
     }
@@ -704,35 +713,48 @@ async function attemptAltchaClick(page, currentStatus = null) {
                 return false;
             }
 
-            await page.waitForTimeout(500);
+            // 自适应等待模态框展开动画结束并滚动至视口
             await altchaWidget.scrollIntoViewIfNeeded().catch(() => {});
 
-            let boxInfo = await page.evaluate(() => {
-                const widget = document.querySelector('altcha-widget');
-                if (!widget) return null;
+            let boxInfo = null;
+            // 最多等待 5 轮 (2.5秒)，确保模态框淡入动画完成并具备有效尺寸
+            for (let round = 0; round < 5; round++) {
+                boxInfo = await page.evaluate(() => {
+                    const widget = document.querySelector('altcha-widget');
+                    if (!widget) return null;
 
-                const pickClickTarget = (root) => {
-                    if (!root) return null;
-                    return root.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
-                };
+                    const pickClickTarget = (root) => {
+                        if (!root) return null;
+                        return root.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                    };
 
-                if (widget.shadowRoot) {
-                    const target = pickClickTarget(widget.shadowRoot);
-                    if (target) {
-                        const rect = target.getBoundingClientRect();
-                        return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: target.tagName };
+                    if (widget.shadowRoot) {
+                        const target = pickClickTarget(widget.shadowRoot);
+                        if (target) {
+                            const rect = target.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: target.tagName };
+                            }
+                        }
                     }
-                }
 
-                const lightDomTarget = pickClickTarget(widget);
-                if (lightDomTarget) {
-                    const rect = lightDomTarget.getBoundingClientRect();
-                    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: lightDomTarget.tagName };
-                }
+                    const lightDomTarget = pickClickTarget(widget);
+                    if (lightDomTarget) {
+                        const rect = lightDomTarget.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: lightDomTarget.tagName };
+                        }
+                    }
 
-                const rect = widget.getBoundingClientRect();
-                return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false, tagName: widget.tagName };
-            });
+                    const rect = widget.getBoundingClientRect();
+                    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false, tagName: widget.tagName };
+                });
+
+                if (boxInfo && boxInfo.width > 0 && boxInfo.height > 0) {
+                    break;
+                }
+                await page.waitForTimeout(500);
+            }
 
             if (boxInfo && boxInfo.width > 0 && boxInfo.height > 0) {
                 let clickX, clickY;
@@ -748,10 +770,11 @@ async function attemptAltchaClick(page, currentStatus = null) {
 
                 await dispatchCdpClick(page, clickX, clickY);
 
+                // 辅助触发 Shadow Root 内部 checkbox
                 await page.evaluate(() => {
                     const widget = document.querySelector('altcha-widget');
                     if (widget && widget.shadowRoot) {
-                        const cb = widget.shadowRoot.querySelector('input[type="checkbox"]');
+                        const cb = widget.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]');
                         if (cb && !cb.checked) {
                             cb.click();
                         }
@@ -760,7 +783,30 @@ async function attemptAltchaClick(page, currentStatus = null) {
 
                 return true;
             } else {
-                console.log('>> 找到了 ALTCHA 元素，但获取不到有效大小，跳过点击。');
+                console.log('>> ⚠️ 无法获取有效物理边界，启动 DOM 级强制注入点击兜底...');
+                const forced = await page.evaluate(() => {
+                    const widget = document.querySelector('altcha-widget');
+                    if (!widget) return false;
+                    let clicked = false;
+                    if (widget.shadowRoot) {
+                        const cb = widget.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                        if (cb) {
+                            cb.focus();
+                            cb.click();
+                            cb.dispatchEvent(new Event('change', { bubbles: true }));
+                            clicked = true;
+                        }
+                    }
+                    const light = widget.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                    if (light) {
+                        light.click();
+                        clicked = true;
+                    }
+                    widget.click();
+                    widget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                });
+                return forced;
             }
         }
     } catch (e) {
@@ -1230,11 +1276,11 @@ async function getMihomoProxies() {
             const res = await axios.get('http://127.0.0.1:9090/proxies/MyGroup');
             const all = res.data.all || [];
             const filtered = all.filter(name => name !== 'DIRECT' && name !== 'REJECT' && name !== 'MyGroup');
-            
+
             if (filtered.length > 0) {
                 return filtered;
             }
-            
+
             console.log(`[代理池] 尝试 ${attempt}: 节点数为0，等待 3 秒后重试...`);
             await new Promise(r => setTimeout(r, 3000));
         } catch (e) {
@@ -1242,7 +1288,7 @@ async function getMihomoProxies() {
             await new Promise(r => setTimeout(r, 3000));
         }
     }
-    
+
     console.error('[代理池] 警告：多次尝试后提取到的节点数依然为0！');
     if (fs.existsSync(path.join(process.cwd(), 'sub1.yaml'))) {
         try {
@@ -1250,12 +1296,12 @@ async function getMihomoProxies() {
             console.error('[代理池] sub1.yaml 下载内容前 500 字符:\n', subContent.substring(0, 500));
         } catch(e) {}
     }
-    
+
     try {
         const logContent = fs.readFileSync(path.join(process.cwd(), 'mihomo.log'), 'utf8');
         console.error('[代理池] Mihomo 运行日志:\n', logContent);
     } catch (err) {}
-    
+
     return [];
 }
 
@@ -1404,7 +1450,7 @@ async function switchMihomoProxy(name) {
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
-        
+
         const dedupeKey = user.username.toLowerCase();
         let nextDateStr = renewDates[dedupeKey];
         if (nextDateStr) {
@@ -1431,7 +1477,7 @@ async function switchMihomoProxy(name) {
         const maxAttempts = (proxyPool.length > 1) ? 5 : 3;
         let page = null;
         let usedNode = 'DIRECT';
-        
+
         for (let accountAttempt = 1; accountAttempt <= maxAttempts; accountAttempt++) {
             if (proxyPool.length > 0) {
                 const nodeName = proxyPool[proxyIndex % proxyPool.length];
@@ -1450,7 +1496,7 @@ async function switchMihomoProxy(name) {
                 if (page && !page.isClosed()) {
                     await page.close().catch(()=>{});
                 }
-                
+
                 await context.clearCookies();
                 page = await context.newPage();
                 page.setDefaultTimeout(60000);
@@ -1460,7 +1506,7 @@ async function switchMihomoProxy(name) {
                 console.log('正在访问登录页...');
                 await page.goto('https://dashboard.katabump.com/auth/login');
                 await page.waitForTimeout(2000);
-                
+
                 const loginTurnstileOk = await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
                 if (!loginTurnstileOk) {
                     console.log('   >> 登录阶段 Turnstile 验证失败，切换节点重试');
@@ -1472,10 +1518,10 @@ async function switchMihomoProxy(name) {
                 const emailInput = page.getByRole('textbox', { name: 'Email' });
                 await emailInput.waitFor({ state: 'visible', timeout: 5000 });
                 await emailInput.fill(user.username);
-                
+
                 const pwdInput = page.getByRole('textbox', { name: 'Password' });
                 await pwdInput.fill(user.password);
-                
+
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
@@ -1528,7 +1574,7 @@ async function switchMihomoProxy(name) {
 
                     console.log(`\n[尝试 ${attempt}/${RENEW_MAX_ATTEMPTS}] 正在寻找 Renew 按钮...`);
                     const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-                    
+
                     try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
 
                     if (await renewBtn.isVisible()) {
@@ -1538,38 +1584,124 @@ async function switchMihomoProxy(name) {
                         const modal = page.locator('.modal-content, [role="dialog"]').filter({ hasText: 'Renew' }).first();
                         try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
                             console.log('模态框未出现？重试中...');
+                            if (IS_DEBUG_MODE) {
+                                const photoDir = path.join(process.cwd(), 'screenshots');
+                                if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                                const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+                                const modalMissShot = path.join(photoDir, `${safeUsername}_modal_missing_${attempt}.png`);
+                                try {
+                                    await saveViewportScreenshot(page, modalMissShot);
+                                    await sendTelegramMessage(`⚠️ *[@s5gydl Debug] 模态框未按预期弹出*\n👤 账号: \`${escapeMarkdown(user.username)}\`\n🔄 尝试: \`${attempt}/${RENEW_MAX_ATTEMPTS}\``, modalMissShot);
+                                } catch (err) {}
+                            }
                             continue;
                         }
 
+                        const photoDir = path.join(process.cwd(), 'screenshots');
+                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+                        const captchaScreenshotName = `${safeUsername}_modal_${attempt}.png`;
+                        const captchaScreenshotPath = path.join(photoDir, captchaScreenshotName);
                         try {
-                            const box = await modal.boundingBox();
-                            if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
+                            await saveViewportScreenshot(page, captchaScreenshotPath);
+                            console.log(`   >> 模态框截图已保存: ${captchaScreenshotName}`);
+                            if (IS_DEBUG_MODE) {
+                                await sendTelegramMessage(
+                                    `🔍 *[@s5gydl Debug] Renew 模态框已弹出*\n` +
+                                    `👤 账号: \`${escapeMarkdown(user.username)}\`\n` +
+                                    `🔄 尝试: \`${attempt}/${RENEW_MAX_ATTEMPTS}\`\n` +
+                                    `🌐 节点: \`${escapeMarkdown(usedNode || '直连')}\``,
+                                    captchaScreenshotPath
+                                );
+                            }
                         } catch (e) { }
 
-                        const confirmBtn = modal.getByRole('button', { name: 'Renew', exact: true });
-                        if (await confirmBtn.isVisible()) {
-                            
-                            const photoDir = path.join(process.cwd(), 'screenshots');
-                            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                            const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-                            const captchaScreenshotName = `${safeUsername}_ALTCHA_${attempt}.png`;
-                            try {
-                                await saveViewportScreenshot(page, path.join(photoDir, captchaScreenshotName));
-                                console.log(`   >> 弹窗截图已保存: ${captchaScreenshotName}`);
-                            } catch (e) { }
-                            
-                            const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
-
+                        // 快速探测是否弹窗中包含可见验证码
+                        const hasVisibleCaptcha = await page.locator('altcha-widget').isVisible({ timeout: 1500 }).catch(() => false);
+                        if (hasVisibleCaptcha) {
+                            console.log('   >> 探测到模态框内含有验证码，尝试算力验证...');
+                            const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 10, 5000);
                             if (!altchaOk) {
-                                console.log('   >> ALTCHA 未通过，跳过确认按钮并刷新重试...');
+                                console.log('   >> 验证码未通过，刷新重试...');
                                 await page.reload();
                                 await page.waitForTimeout(3000);
                                 if (page.url().includes('login')) break;
                                 continue;
                             }
+                        } else {
+                            console.log('   >> 模态框无验证码，直接准备确认续期！');
+                        }
 
-                            console.log('   >> 点击弹窗中的 Renew 确认按钮...');
-                            await confirmBtn.click();
+                        /* =========================================================================
+                         * [备用历史逻辑保留]：若未来 KataBump 服务器重新在弹窗中引入 ALTCHA 验证码，可解开以下代码：
+                         * =========================================================================
+                         * // 1. 显式等待模态框内 altcha-widget 渲染展开
+                         * try {
+                         *     const altchaWidgetLoc = modal.locator('altcha-widget').first();
+                         *     await altchaWidgetLoc.waitFor({ state: 'visible', timeout: 10000 });
+                         *     console.log('   >> 模态框内 ALTCHA 组件已展开呈现。');
+                         * } catch (e) {
+                         *     console.log('   >> 模态框内未检测到显式可见的 altcha-widget，继续尝试解算...');
+                         * }
+                         *
+                         * // 2. 深度算力求解与验证
+                         * const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
+                         * if (!altchaOk) {
+                         *     console.log('   >> ALTCHA 未通过，跳过确认按钮并刷新重试...');
+                         *     if (IS_DEBUG_MODE) {
+                         *         const altchaFailShot = path.join(photoDir, `${safeUsername}_ALTCHA_fail_${attempt}.png`);
+                         *         try {
+                         *             await saveViewportScreenshot(page, altchaFailShot);
+                         *             await sendTelegramMessage(`⚠️ *[@s5gydl Debug] ALTCHA 验证未通过现场*\n👤 账号: \`${escapeMarkdown(user.username)}\``, altchaFailShot);
+                         *         } catch (err) {}
+                         *     }
+                         *     await page.reload();
+                         *     await page.waitForTimeout(3000);
+                         *     if (page.url().includes('login')) break;
+                         *     continue;
+                         * }
+                         * ========================================================================= */
+
+                        console.log('   >> 点击模态框中的紫色 Renew 确认按钮...');
+                        let confirmClicked = false;
+
+                        // 1. Playwright 优先尝试点击模态框内文本严格匹配为 Renew 的按钮
+                        try {
+                            const modalRenewBtn = modal.locator('button').filter({ hasText: /^Renew$/i }).first();
+                            await modalRenewBtn.click({ force: true, timeout: 3000 });
+                            confirmClicked = true;
+                            console.log('   >> ✅ 模态框 Renew 按钮已点击 (Playwright)');
+                        } catch (e) {
+                            console.log('   >> ⚠️ Playwright 快速点击未命中，切换 DOM 精确触发...');
+                        }
+
+                        // 2. DOM 级精确寻找并触发弹窗内的 Renew 按钮
+                        if (!confirmClicked) {
+                            confirmClicked = await page.evaluate(() => {
+                                const modalEl = document.querySelector('.modal-content, [role="dialog"], .modal');
+                                if (modalEl) {
+                                    const btns = Array.from(modalEl.querySelectorAll('button'));
+                                    // 优先找文本为 Renew 的按钮，避免点到 Close
+                                    const renewBtnEl = btns.find(b => b.textContent && b.textContent.trim().toLowerCase() === 'renew');
+                                    if (renewBtnEl) {
+                                        renewBtnEl.disabled = false;
+                                        renewBtnEl.focus();
+                                        renewBtnEl.click();
+                                        return true;
+                                    }
+                                    // 兜底找除 close 之外的最后一个按钮
+                                    const actionBtn = btns.filter(b => !b.textContent.toLowerCase().includes('close')).pop();
+                                    if (actionBtn) {
+                                        actionBtn.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            });
+                            if (confirmClicked) {
+                                console.log('   >> ✅ 已通过 DOM 注入精准触发模态框 Renew 按钮！');
+                            }
+                        }
 
                             let hasCaptchaError = false;
                             try {
@@ -1627,17 +1759,17 @@ async function switchMihomoProxy(name) {
                             await page.waitForTimeout(2000);
                             if (!await modal.isVisible()) {
                                 console.log('   >> ✅ Renew successful!');
-                                
+
                                 console.log('   >> 尝试获取续期后的精确日期...');
                                 await page.reload();
                                 await page.waitForTimeout(3000);
-                                
+
                                 let accurateDate = "已续期(待下次更新)";
                                 let accurateDays = "约30";
                                 try {
                                     const bodyText = await page.innerText('body').catch(() => '');
                                     const expiryMatch = bodyText.match(/Expiry\s*[\n\r]*\s*(\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-zA-Z]+(?:\s+\d{4})?)/i);
-                                    
+
                                     if (expiryMatch) {
                                         accurateDate = expiryMatch[1];
                                         let parsedDays = parseExpiryDate(accurateDate);
@@ -1668,13 +1800,13 @@ async function switchMihomoProxy(name) {
                                 } catch(e) {
                                     console.log("   >> 获取精确日期失败: " + e.message);
                                 }
-                                
+
                                 const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
                                 try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
                                 await sendTelegramMessage(`✅ *[@s5gydl] ${escapeMarkdown(user.username)}*\n续期成功！\n📅 有效期更新至: \`${accurateDate}\` (还剩 ${accurateDays} 天)`, successScreenshot);
                                 renewPhaseSuccess = true;
                                 stats.success++;
-                                
+
                                 saveRenewDates(renewDates);
                                 accountDatesInfo[user.username] = {
                                     status: "✅ 续期成功",
@@ -1690,12 +1822,6 @@ async function switchMihomoProxy(name) {
                                 if (page.url().includes('login')) break;
                                 continue;
                             }
-                        } else {
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            if (page.url().includes('login')) break;
-                            continue;
-                        }
                     } else {
                         console.log('未找到 Renew 按钮 (可能已结束)。');
                         break;
@@ -1735,7 +1861,7 @@ async function switchMihomoProxy(name) {
                 node: usedNode
             };
         }
-        
+
         if (page && !page.isClosed()) {
             const photoDir = path.join(process.cwd(), 'screenshots');
             if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
@@ -1748,7 +1874,7 @@ async function switchMihomoProxy(name) {
     // --- 发送最终汇总报告 ---
     let summaryMessage = `📊 *续期任务汇总报告*\n`;
     summaryMessage += `📢 来源群组: @s5gydl\n\n`;
-    
+
     if (proxyStats.source !== 'NONE') {
         summaryMessage += `🌐 *节点池状态* (${proxyStats.source}):\n`;
         summaryMessage += `- 📥 提取总数: ${proxyStats.total}\n`;
@@ -1768,7 +1894,7 @@ async function switchMihomoProxy(name) {
     summaryMessage += `✅ 成功续期: ${stats.success}\n`;
     summaryMessage += `⏳ 暂未到期: ${stats.skipped}\n`;
     summaryMessage += `❌ 失败数量: ${stats.failed}\n\n`;
-    
+
     summaryMessage += `📅 *账号详细信息*:\n`;
     users.forEach(user => {
         let info = accountDatesInfo[user.username];
@@ -1784,7 +1910,7 @@ async function switchMihomoProxy(name) {
                  }
              }
         }
-        
+
         summaryMessage += `\n👤 \`${escapeMarkdown(user.username)}\`\n`;
         summaryMessage += ` ├ 状态: ${info.status}\n`;
         summaryMessage += ` ├ 节点: \`${escapeMarkdown(info.node)}\`\n`;
@@ -1797,7 +1923,7 @@ async function switchMihomoProxy(name) {
             summaryMessage += `- \`${escapeMarkdown(acc)}\`\n`;
         });
     }
-    
+
     await sendTelegramMessage(summaryMessage);
 
     console.log('完成。');
